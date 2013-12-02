@@ -1,0 +1,10 @@
+use PowerDNS::DB::Test;
+use PowerDNS::Validator::Records;
+use PowerDNS::Validator::Domains;
+use Data::Dumper;
+$d = PowerDNS::DB::Test->new();
+$v = PowerDNS::Validator::Records->new;
+$v2 = PowerDNS::Validator::Domains->new;
+$d->schema->add_validator($v);
+$d->schema->add_validator($v2);
+print $d->schema->validate('create record', $d->records->first)->as_string;

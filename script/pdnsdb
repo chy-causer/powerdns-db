@@ -1,0 +1,455 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use 5.014;
+
+use Config::Tiny;
+use DBI;
+use Data::Dumper;
+use PowerDNS::DB;
+use Text::Table;
+use Carp;
+use Scriptalicious;
+use Try::Tiny;
+use JSON;
+use Pod::Usage;
+use Term::ANSIColor;
+
+our $VERSION = $PowerDNS::DB::VERSION;
+
+my $FORCE_RUN   = 0;
+my $DRY_RUN     = 0;
+my $CONFIG_FILE = '/etc/powerdns-db/config.ini';
+
+# Command-line args
+getopt getconf(
+    "force-run|f"   => \$FORCE_RUN,
+    "config-file=s" => \$CONFIG_FILE,
+    "dry-run"       => \$DRY_RUN,
+);
+
+abort_ifnofile($CONFIG_FILE);
+
+my $CONFIG = Config::Tiny->read("$CONFIG_FILE")
+  || die "Error parsing config file $CONFIG_FILE";
+
+# Get some config;
+my $db_dsn  = $CONFIG->{database}->{dsn};
+my $db_user = $CONFIG->{database}->{user};
+my $db_pass = $CONFIG->{database}->{pass};
+my $record_scope = $CONFIG->{record_scope} || {};
+my $domain_scope = $CONFIG->{domain_scope} || {};
+
+my $dbh     = DBI::->connect( $db_dsn, $db_user, $db_pass, { RaiseError => 1 } )
+  or barf "Invalid credentials supplied";
+
+my $pdns = PowerDNS::DB->connect( sub{$dbh} );
+
+#############################################################################
+#                                  subroutines                              #
+#############################################################################
+
+sub usage_and_exit {
+    pod2usage();
+    exit;
+}
+
+sub abort_ifnofile {
+    my $file = shift;
+
+    if ( !-f "$file" ) {
+        barf "Required file \"$file\" doesn't exist, aborting\n";
+    }
+    if ( !-r "$file" ) {
+        barf "\"$file\" exists but we have no read permission, aborting";
+    }
+    return;
+}
+
+sub process_validation_results {
+    my ($validation_results) = @_;
+    print $validation_results;
+
+    if ( $validation_results->errors ) {
+        say "Aborting";
+        exit;
+    }
+    elsif ( $validation_results->warnings ) {
+        if ( !prompt_yn("Do you wish to proceed?") ) {
+            say "Aborting";
+            exit;
+        }
+    }
+}
+
+sub format_records {
+    my (@records) = @_;
+    my $rtn = '';
+    my @fields = qw/id name type content ttl/;
+    if ( grep { $_->type eq 'MX' } @records ) {
+        push @fields, 'prio';
+    }
+    my $tb = Text::Table->new(@fields, 'Paired?');
+    if (@records) {
+        foreach my $record (@records) {
+            my @record_values;
+            foreach my $field (@fields) {
+                push @record_values, $record->$field;
+            }
+            if ( $record->reverse_record ) {
+                push @record_values, 'x';
+            }
+            $tb->add(@record_values);
+        }
+    }
+    $rtn .= $tb;
+    $rtn .= "================================\n";
+    my $number_of_records_found = scalar @records;
+    my $noun = $number_of_records_found != 1 ? 'records' : 'record';
+    $rtn .= "$number_of_records_found $noun found\n";
+    return $rtn;
+}
+
+sub banner {
+    return <<EOF;
+
+=============================================================================
+# PowerDNS::DB frontend interface                  ##########################
+=============================================================================
+|                                                                           |
+| This code is in a state of flux and therefore any command can change      |
+| before release.                                                           |
+|                                                                           |
+| Feedback welcome :)                                                       |
+=============================================================================
+
+EOF
+}
+
+sub input_help {
+    my @available_keys = @_;
+    return <<EOF;
+EOF
+}
+
+sub list_records {
+    my $search_parameters = input_to_perl_data(
+        "What do you want me to search for?");
+    print format_records(
+        $pdns->records->search($record_scope, {prefetch => 'domain'})
+            ->search($search_parameters)->all
+    );
+}
+sub update_records {
+    my $search_parameters = input_to_perl_data("What do you want me to update?");
+    my $records = $pdns->records->search($record_scope, {prefetch => 'domain'})
+        ->search($search_parameters);
+    say "Search matched ", $records->count, " record", ( $records->count == 1 ? '' : 's' );
+
+    if ( $records->count ) {
+        if (prompt_Yn("You want to see these records")) {
+            print format_records( $records->all );
+        }
+
+        my $updated_fields;
+        my $new_ttl = prompt_string("TTL:");
+        $updated_fields->{ttl} = $new_ttl if $new_ttl;
+
+        # Is the content field unique?
+        if ($records->count == $records->search({content => $records->first->content})->count) {
+            my $new_content = prompt_string("Content:");
+            $updated_fields->{content} = $new_content if $new_content;
+        }
+
+        if ($records->update($updated_fields)) {
+            say "Updated successfully";
+        }
+        else {
+            say "Update failed. Proper debug info not yet available";
+            say $pdns->last_validation;
+        }
+    }
+}
+sub delete_records {
+    my $search_parameters = input_to_perl_data(
+        "Give me search criteria for records you wish deleted");
+    my $records = $pdns->records->search($record_scope, {prefetch => 'domain'})
+        ->search($search_parameters);
+    my $records_count = $records->count;
+    if ( $records_count ) {
+        if ( $records_count > 100 ) {
+            say "Cannot delete $records_count records. That's too many";
+            exit 1;
+        }
+        else {
+            $records->delete;
+            say "Deleted $records_count record", $records_count == 1 ? '' : 's';
+        }
+    }
+    else {
+        say "No records match search criteria";
+    }
+};
+sub create_record {};
+
+sub input_to_perl_data {
+    my $message = shift;
+    say color('bold'),
+        $message,
+        " ( type 'help' for formatting rules and examples)",
+        color('reset')
+        if $message;
+
+    my $search_string = '';
+    while ( my $line = <STDIN>) {
+        chomp $line;
+        if ( $line =~ s%^\s*file://%% ) {
+            local $/;
+            open( my $fh, '<', $line ) or do {
+                say "Cannot read file $line: $!";
+                return input_to_perl_data($message);
+            }
+            ;
+            $search_string = <$fh>;
+            last;
+        }
+        elsif ( $line =~ m/^\s*help\s*$/i ) {
+            pod2usage(-verbose => 99,
+                -message => "****\nHELP ON SEARCHING\n****\n\n",
+                -sections => [ 'USING THE SCRIPT/Searching' ],
+                -exitval => 'NOEXIT',
+            );
+            return input_to_perl_data($message);
+        }
+        last if $line =~ m/^\s*(?:\.|END)$/;
+        $search_string .= $line;
+
+        # XXX TODO: Not efficient. We should be decoding only once.
+        #
+        # Maybe match for a balanced {} or []?
+        last if try { decode_json( $search_string ); 1; };
+    }
+
+    # I feel so dirty doing this.
+    # Do not want ambiguous fields when doing a prefetch with
+    # domains. As such, you need to prepend some fields with "me."
+    #
+    # Probably can be broken using some pretty weird input syntax.
+    # It's good enough though and if anyone complains, tell them
+    # they're just being difficult.
+    $search_string =~ s/"(name|id|type)"[\s\r\n]*:/"me.$1":/g;
+
+    my $search_parameters =
+        try { decode_json( $search_string ); }
+        catch { say $_; input_to_perl_data(); };
+    
+    if ( ref $search_parameters eq 'ARRAY' ) {
+        $search_parameters = {
+            "me.name" => $search_parameters
+        };
+    }
+
+    return $search_parameters;
+}
+
+#############################################################################
+#                               main loop                                   #
+#############################################################################
+
+my $action = shift;
+
+if ( !$action ) {
+    usage_and_exit;
+}
+else {
+    given ($action) {
+        when (/^update-records?$/) {
+            print banner;
+            update_records;
+        }
+        when (/^(?:list-records|search)$/) {
+            print banner;
+            list_records;
+        }
+        when (/^delete-records?$/) {
+            print banner;
+            delete_records;
+        }
+        when ('create-record') {
+            print banner;
+            create_record;
+        }
+        default {
+            say "Unknown action $action";
+            usage_and_exit;
+        }
+    }
+}
+
+__END__
+
+=head1 NAME
+
+pdnsdb - Manage the PowerDNS database
+
+
+=head1 SYNOPSIS
+
+    pdnsdb COMMAND
+
+where COMMAND is any of the following
+
+=over
+
+=item create-record
+
+=item update-records
+
+=item delete-records
+
+=item list-records (or search)
+
+=back
+
+=head1 VERSION
+
+This documentation refers to svn version 3626
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--config-file>
+
+Specify another config file with DB connection information
+
+=item B<-h, --help>
+
+Display a program usage screen and exit
+
+=item B<-q, --quiet>
+
+Suppress all normal program output; only display errors and
+warnings
+
+=item B<-d, --debug>
+
+Display debug output
+
+=back
+
+=head1 USING THE SCRIPT
+
+=head2 Searching
+
+Whenever you are requested to input some searching constraints, there are two
+methods for input:
+
+=over
+
+=item A well-formed JSON hash
+
+    { "name": "www.example.org" }
+
+=item A filename in URI format. The file must contain well-formed JSON
+
+    file:///tmp/wibble.json
+
+=back
+
+=head3 Available keys
+
+=over
+
+=item name
+
+Record name (e.g. www.example.org)
+
+=item content
+
+Record content (e.g. 192.168.56.1)
+
+=item type
+
+Record type (e.g. A, AAAA, CNAME, MX)
+
+=item ttl
+
+Record TTL. Must be an integer
+
+=item domain_id
+
+Must be integer
+
+=item domain.name
+
+The domain to which the record belongs (e.g. example.org)
+
+=back
+
+There are other fields that I will not mention.
+
+=head3 Complicated examples
+
+The data structure is passed to a DBIx module so anyone with sufficient
+will can craft options using the instructions here:
+
+L<http://search.cpan.org/~frew/SQL-Abstract-1.73/lib/SQL/Abstract.pm>
+
+That may be a little harder to digest so here are some concrete examples:
+
+=head4 Record starting with 'wibble'
+
+
+E.g. 'wibble.ox.ac.uk', 'wibble.it.ox.ac.uk', but not 'www.wibble.org'
+
+    { "name": { "like" : "wibble.%" } }
+
+=head4 Record in domain example.org
+
+    { "domain.name": "example.org" }
+
+=head4 Records ending in co.uk and org with TTL less than 301
+
+    { "ttl" : { "<", 301 }, "name": [ { "like": '%co.uk' }, { "like": "%.com"} ] }
+
+=head2 Exiting the script
+
+    Ctrl + c
+
+=head1 DIAGNOSTICS
+
+The script should give an accurate warning if it cannot open a required file
+
+=head1 CONFIGURATION
+
+configuration file /etc/powerdns-db/config.ini or file specified at runtime (see L</OPTIONS>)
+
+=head1 DEPENDENCIES
+
+Digest::MD5, Config::Tiny, Scriptalicious
+
+=head1 INCOMPATIBILITIES
+
+none known
+
+=head1 BUGS AND LIMITATIONS
+
+Converted from a bash script, calls the command line a lot.
+
+There is an annoyance in that if you have a kerberos ticket, and it's not quite right for
+ksu'ing into the "SUDO" user, then the process will appear to have hung. It hasn't hung.
+What is actually happening is that ksu is prompting for a password, which is being suppressed
+by Scripalicious::run. The way round it is to make sure your principal is in ~/SUDOUSER/.k5login,
+and not some mutation of it (most likely oucs1234/root@OX.AC.UK).
+
+Report any found to <hostmaster@ox.ac.uk>
+
+=head1 AUTHOR
+
+Guy Edwards, maintained by <hostmaster@ox.ac.uk>
+
+=head1 LICENSE AND COPYRIGHT
+
+(c) University of Oxford
